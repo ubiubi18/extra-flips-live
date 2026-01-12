@@ -1,0 +1,26 @@
+{
+  "epoch": 180,
+  "threshold": 3,
+  "baseUrl": "https://api.idena.io/api",
+  "counts": {
+    "flipsSeen": 173,
+    "uniqueAuthors": 49,
+    "authorsOverThreshold": 21,
+    "totalExtraFlips": 34
+  },
+  "stake": {
+    "fetchStakeOverThresholdEnabled": false,
+    "fetchStakeAllEnabled": false,
+    "stakeSleepSeconds": 0.1,
+    "overThreshold": {
+      "authorsWithStake>0": 0,
+      "totalStake": 0.0,
+      "extraFlipsPerTotalStake": null
+    },
+    "allAuthors": {
+      "authorsWithStake>0": 0,
+      "totalStake": 0.0
+    }
+  },
+  "note": "Live snapshot. Data can change until flip submission closes."
+}
