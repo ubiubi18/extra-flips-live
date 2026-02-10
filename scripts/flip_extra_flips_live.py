@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import heapq
 import json
 import os
 import time
@@ -42,6 +43,82 @@ def utc_ts() -> str:
 
 def log(msg: str) -> None:
     print(f"[{utc_ts()}] {msg}", flush=True)
+
+
+def iso_to_unix(iso_value: str) -> Optional[float]:
+    try:
+        if iso_value.endswith("Z"):
+            iso_value = iso_value[:-1] + "+00:00"
+        return datetime.fromisoformat(iso_value).timestamp()
+    except Exception:
+        return None
+
+
+def unix_to_iso(ts: float) -> str:
+    return datetime.utcfromtimestamp(ts).isoformat(timespec="seconds") + "Z"
+
+
+def load_json_file(path: str) -> Dict[str, Any]:
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def write_json_file(path: str, data: Dict[str, Any]) -> None:
+    if not path:
+        return
+    dir_name = os.path.dirname(path)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp_path, path)
+
+
+def normalize_progress_points(rows: Any) -> List[Dict[str, Any]]:
+    if not isinstance(rows, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        ts = row.get("timestamp")
+        if not isinstance(ts, str):
+            continue
+        normalized.append(
+            {
+                "timestamp": ts,
+                "flipsSeen": int(safe_float(row.get("flipsSeen"))),
+                "uniqueAuthors": int(safe_float(row.get("uniqueAuthors"))),
+            }
+        )
+    normalized.sort(key=lambda x: x["timestamp"])
+    return normalized
+
+
+def build_progress_series(history_by_epoch: Dict[str, Any], epoch: int) -> Dict[str, Any]:
+    current_points = normalize_progress_points(history_by_epoch.get(str(epoch), []))
+    previous_epochs: List[Dict[str, Any]] = []
+
+    for prev_epoch in (epoch - 1, epoch - 2):
+        if prev_epoch <= 0:
+            continue
+        prev_points = normalize_progress_points(history_by_epoch.get(str(prev_epoch), []))
+        if prev_points:
+            previous_epochs.append({"epoch": prev_epoch, "points": prev_points})
+
+    return {
+        "currentEpoch": {"epoch": epoch, "points": current_points},
+        "previousEpochs": previous_epochs,
+    }
 
 
 class HttpClient:
@@ -80,16 +157,39 @@ class HttpClient:
         raise RuntimeError(f"GET failed after {self.retries} retries: {url} ({last_err})")
 
 
-def get_current_epoch(api: HttpClient) -> int:
+def extract_epoch_and_validation_time(res: Any) -> Tuple[int, Optional[str]]:
+    epoch = 0
+    validation_time: Optional[str] = None
+
+    if isinstance(res, int):
+        epoch = res
+    elif isinstance(res, dict):
+        for k in ("epoch", "Epoch", "number", "Number"):
+            v = res.get(k)
+            if isinstance(v, int):
+                epoch = v
+                break
+        vt = res.get("validationTime")
+        if isinstance(vt, str):
+            validation_time = vt
+
+    return epoch, validation_time
+
+
+def get_current_epoch_info(api: HttpClient) -> Tuple[int, Optional[str]]:
     js = api.get_json("/Epoch/Last")
     res = js.get("result")
-    if isinstance(res, int):
-        return res
-    if isinstance(res, dict):
-        for k in ("epoch", "Epoch", "number", "Number"):
-            if k in res and isinstance(res[k], int):
-                return res[k]
+    epoch, validation_time = extract_epoch_and_validation_time(res)
+    if epoch > 0:
+        return epoch, validation_time
     raise RuntimeError(f"Unexpected /Epoch/Last result: {res}")
+
+
+def get_epoch_validation_time(api: HttpClient, epoch: int) -> Optional[str]:
+    js = api.get_json(f"/Epoch/{epoch}")
+    res = js.get("result")
+    _, validation_time = extract_epoch_and_validation_time(res)
+    return validation_time
 
 
 def paged_flips(api: HttpClient, epoch: int, page_size: int, sleep_per_page: float) -> Iterable[Dict[str, Any]]:
@@ -103,6 +203,30 @@ def paged_flips(api: HttpClient, epoch: int, page_size: int, sleep_per_page: flo
         items = js.get("result") or []
         if not isinstance(items, list):
             raise RuntimeError(f"Unexpected result type at /Epoch/{epoch}/Flips: {type(items)}")
+
+        for it in items:
+            if isinstance(it, dict):
+                yield it
+
+        token = js.get("continuationToken")
+        if not token:
+            break
+
+        if sleep_per_page > 0:
+            time.sleep(sleep_per_page)
+
+
+def paged_bad_authors(api: HttpClient, epoch: int, page_size: int, sleep_per_page: float) -> Iterable[Dict[str, Any]]:
+    token: Optional[str] = None
+    while True:
+        params: Dict[str, Any] = {"limit": page_size}
+        if token:
+            params["continuationToken"] = token
+
+        js = api.get_json(f"/Epoch/{epoch}/Authors/Bad", params=params)
+        items = js.get("result") or []
+        if not isinstance(items, list):
+            raise RuntimeError(f"Unexpected result type at /Epoch/{epoch}/Authors/Bad: {type(items)}")
 
         for it in items:
             if isinstance(it, dict):
@@ -138,266 +262,216 @@ def try_get_cid(flip: Dict[str, Any]) -> str:
     return c if isinstance(c, str) else ""
 
 
-def extract_stake_from_result(res: Any) -> Tuple[float, str]:
-    """
-    Try multiple known-ish shapes. Returns (stake, note).
-    """
-    if not isinstance(res, dict):
-        return 0.0, "result_not_dict"
+def try_get_words(flip: Dict[str, Any]) -> Tuple[str, str]:
+    words = flip.get("words")
+    if not isinstance(words, dict):
+        return "", ""
 
-    # common top-level keys
-    for k in ("stake", "Stake", "stakeBalance", "stakeAmount"):
-        if k in res:
-            return safe_float(res.get(k)), ""
+    word1 = words.get("word1")
+    word2 = words.get("word2")
+    word1_name = ""
+    word2_name = ""
 
-    # nested balance object
-    bal = res.get("balance")
-    if isinstance(bal, dict):
-        for k in ("stake", "Stake"):
-            if k in bal:
-                return safe_float(bal.get(k)), ""
+    if isinstance(word1, dict):
+        name = word1.get("name")
+        if isinstance(name, str):
+            word1_name = name
 
-    # nested profile/state object
-    for k in ("profile", "state"):
-        obj = res.get(k)
-        if isinstance(obj, dict):
-            for kk in ("stake", "Stake"):
-                if kk in obj:
-                    return safe_float(obj.get(kk)), ""
+    if isinstance(word2, dict):
+        name = word2.get("name")
+        if isinstance(name, str):
+            word2_name = name
 
-    return 0.0, "stake_not_found"
+    return word1_name, word2_name
 
 
-def fetch_stake_for_address_best_effort(api: HttpClient, address: str) -> Tuple[float, str]:
-    """
-    Best-effort stake fetch with fallback endpoints.
-    Returns (stake, note).
-    """
-    # Try /Address/{addr}
-    try:
-        js = api.get_json(f"/Address/{address}")
-        stake, note = extract_stake_from_result(js.get("result"))
-        if stake > 0 or note != "stake_not_found":
-            return stake, note
-    except Exception as e:
-        # keep going, try fallback
-        pass
+def fetch_wrongwords_bad_authors(api: HttpClient, epoch: int, page_size: int, sleep_per_page: float) -> set[str]:
+    bad: set[str] = set()
+    for row in paged_bad_authors(api, epoch=epoch, page_size=page_size, sleep_per_page=sleep_per_page):
+        addr = row.get("address")
+        reason = row.get("reason")
+        wrong_words_flag = row.get("wrongWords")
 
-    # Try /Identity/{addr} as fallback
-    try:
-        js = api.get_json(f"/Identity/{address}")
-        stake, note = extract_stake_from_result(js.get("result"))
-        return stake, note
-    except Exception as e:
-        return 0.0, f"stake_fetch_error:{e}"
+        if isinstance(addr, str) and len(addr) == 42 and addr.startswith("0x"):
+            if reason == "WrongWords" or wrong_words_flag is True:
+                bad.add(addr.lower())
+    return bad
 
 
-def write_csv(path: str, header: List[str], rows: List[List[Any]]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(header)
-        w.writerows(rows)
+def build_grade_identity_leaderboard(
+    api: HttpClient,
+    epoch: int,
+    page_size: int,
+    sleep_per_page: float,
+    allowed_statuses: List[str],
+    include_zero: bool,
+    top_n: int,
+    top_flips_n: int,
+    out_dir: str,
+) -> Dict[str, Any]:
+    allowed_status = set(allowed_statuses) if allowed_statuses else None
 
+    log(f"Fetching wrongWords bad authors for epoch {epoch} ...")
+    bad_authors = fetch_wrongwords_bad_authors(api, epoch=epoch, page_size=page_size, sleep_per_page=sleep_per_page)
+    log(f"wrongWords bad authors (epoch {epoch}): {len(bad_authors)}")
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="Live count of identities with >N published flips in the current epoch.")
-    ap.add_argument("--base-url", default=BASE_URL_DEFAULT, help="Idena API base URL (default: https://api.idena.io/api)")
-    ap.add_argument("--epoch", type=int, default=0, help="Epoch number. If 0, uses current epoch from /Epoch/Last.")
-    ap.add_argument("--threshold", type=int, default=3, help="Count identities with flipCount > threshold (default: 3).")
-    ap.add_argument("--page-size", type=int, default=100, help="Pagination page size (limit=). Max is 100.")
-    ap.add_argument("--sleep-per-page", type=float, default=0.1, help="Delay between list pages (sec).")
-    ap.add_argument("--top", type=int, default=50, help="Print top N authors by flipCount to console.")
-    ap.add_argument("--out-dir", default="./out", help="Output directory.")
-    ap.add_argument("--fetch-stake", action="store_true", help="Fetch stake for authors with extra flips (flipCount > threshold).")
-    ap.add_argument("--fetch-stake-all", action="store_true", help="Fetch stake for ALL authors who submitted flips (heavy).")
-    ap.add_argument("--stake-sleep", type=float, default=0.10, help="Sleep between stake calls (sec). Helps avoid rate limits.")
-    args = ap.parse_args()
+    totals: Dict[str, Dict[str, float]] = {}
+    flips_seen = 0
+    flips_kept = 0
+    flip_heap: List[Tuple[float, str, Dict[str, Any]]] = []
+    top_flips_limit = max(0, int(top_flips_n))
 
-    if args.page_size < 1 or args.page_size > MAX_PAGE_SIZE:
-        raise SystemExit(f"--page-size must be 1..{MAX_PAGE_SIZE}")
-
-    api = HttpClient(base_url=args.base_url)
-
-    epoch = args.epoch
-    if epoch == 0:
-        epoch = get_current_epoch(api)
-
-    thr = int(args.threshold)
-
-    log(f"Epoch: {epoch} (live)")
-    log(f"Fetching flips and counting authors (threshold > {thr}) ...")
-
-    counts: Counter[str] = Counter()
-    seen = 0
-
-    for fl in paged_flips(api, epoch=epoch, page_size=args.page_size, sleep_per_page=args.sleep_per_page):
-        seen += 1
+    log(f"Building gradeScore identity leaderboard for epoch {epoch} ...")
+    for fl in paged_flips(api, epoch=epoch, page_size=page_size, sleep_per_page=sleep_per_page):
+        flips_seen += 1
         author = try_get_author(fl)
-        cid = try_get_cid(fl)
-        if not author or not cid:
+        if not author or author in bad_authors:
             continue
-        counts[author] += 1
-        if seen % 2000 == 0:
-            log(f"processed flips: {seen} (unique authors so far: {len(counts)})")
 
-    total_authors = len(counts)
-    authors_gt = [a for a, c in counts.items() if c > thr]
-    authors_gt_n = len(authors_gt)
-    total_extra_flips = sum(max(0, counts[a] - thr) for a in authors_gt)
+        status = fl.get("status")
+        if allowed_status is not None and status not in allowed_status:
+            continue
 
-    log(f"Done. flips_seen={seen} unique_authors={total_authors}")
-    log(f"authors_with_flipCount>{thr}: {authors_gt_n}")
-    log(f"total_extra_flips_over_{thr}: {total_extra_flips}")
+        grade_score = safe_float(fl.get("gradeScore"))
+        if (not include_zero) and grade_score <= 0:
+            continue
 
-    ranked = sorted(((a, counts[a]) for a in counts), key=lambda x: (x[1], x[0]), reverse=True)
+        flips_kept += 1
 
-    topn = max(0, int(args.top))
-    if topn:
-        print("\n=== TOP AUTHORS by flipCount (live) ===")
-        for i, (a, c) in enumerate(ranked[:topn], start=1):
-            extra = max(0, c - thr)
-            mark = "  EXTRA" if extra > 0 else ""
-            print(f"{i:4d}  flips={c:2d}  extra={extra:2d}  {a}{mark}")
+        if author not in totals:
+            totals[author] = {"total": 0.0, "count": 0.0, "max": 0.0}
 
-    out_dir = args.out_dir
-    os.makedirs(out_dir, exist_ok=True)
+        totals[author]["total"] += grade_score
+        totals[author]["count"] += 1.0
+        if grade_score > totals[author]["max"]:
+            totals[author]["max"] = grade_score
 
-    # Always write CSV for authors over threshold
-    csv_path_over = os.path.join(out_dir, f"live_extra_flips_epoch{epoch}_gt{thr}.csv")
+        if flips_seen % 2000 == 0:
+            log(f"grade leaderboard progress: seen={flips_seen} kept={flips_kept}")
 
-    # Optional new CSV for all authors with flips + stake
-    csv_path_all = os.path.join(out_dir, f"live_flip_authors_epoch{epoch}.csv")
+        cid = try_get_cid(fl)
+        if top_flips_limit > 0 and cid:
+            word1, word2 = try_get_words(fl)
+            flip_row = {
+                "cid": cid,
+                "author": author,
+                "gradeScore": grade_score,
+                "status": status if isinstance(status, str) else "",
+                "word1": word1,
+                "word2": word2,
+            }
+            heap_item = (grade_score, cid, flip_row)
+            if len(flip_heap) < top_flips_limit:
+                heapq.heappush(flip_heap, heap_item)
+            else:
+                if (grade_score, cid) > (flip_heap[0][0], flip_heap[0][1]):
+                    heapq.heapreplace(flip_heap, heap_item)
 
-    meta_path = os.path.join(out_dir, f"live_extra_flips_epoch{epoch}_gt{thr}.meta.json")
+    identities = []
+    for addr, agg in totals.items():
+        count = int(agg["count"])
+        total = float(agg["total"])
+        max_score = float(agg["max"])
+        avg = (total / count) if count else 0.0
+        identities.append(
+            {
+                "address": addr,
+                "totalGradeScore": total,
+                "flipCount": count,
+                "avgGradeScore": avg,
+                "maxFlipGradeScore": max_score,
+            }
+        )
 
-    # Stake fetching plan
-    do_stake_over = bool(args.fetch_stake)
-    do_stake_all = bool(args.fetch_stake_all)
-
-    if do_stake_all:
-        do_stake_over = False  # avoid double work, we will already cover everyone
-
-    stake_cache: Dict[str, Tuple[float, str]] = {}
-
-    def get_stake_cached(addr: str) -> Tuple[float, str]:
-        if addr in stake_cache:
-            return stake_cache[addr]
-        s, note = fetch_stake_for_address_best_effort(api, addr)
-        stake_cache[addr] = (s, note)
-        if args.stake_sleep > 0:
-            time.sleep(args.stake_sleep)
-        return s, note
-
-    # 1) Write authors over threshold CSV
-    rows_over: List[List[Any]] = []
-    stake_total_over = 0.0
-    stake_rows_over = 0
-
-    for a in sorted(authors_gt, key=lambda x: (counts[x], x), reverse=True):
-        c = counts[a]
-        extra = max(0, c - thr)
-        stake = ""
-        extra_per_stake = ""
-        stake_note = ""
-
-        if do_stake_over:
-            s, note = get_stake_cached(a)
-            stake_note = note
-            stake = f"{s:.8f}"
-            if s > 0:
-                extra_per_stake = f"{(extra / s):.12f}"
-                stake_total_over += s
-                stake_rows_over += 1
-
-        rows_over.append([
-            a,
-            c,
-            extra,
-            stake,
-            extra_per_stake,
-            stake_note,
-            f"https://scan.idena.io/address/{a}",
-        ])
-
-    write_csv(
-        csv_path_over,
-        header=["address", "flipCount", "extraFlipsOverThreshold", "stake", "extraFlipsPerStake", "stakeNote", "scan_url"],
-        rows=rows_over,
+    identities_sorted = sorted(
+        identities,
+        key=lambda x: (x["totalGradeScore"], x["flipCount"], x["address"]),
+        reverse=True,
     )
 
-    # 2) Optionally write all authors stake CSV
-    stake_total_all = 0.0
-    stake_rows_all = 0
-
-    if do_stake_all:
-        log(f"Fetching stake for ALL flip authors: {len(counts)} addresses")
-        rows_all: List[List[Any]] = []
-        for i, (a, c) in enumerate(ranked, start=1):
-            s, note = get_stake_cached(a)
-            if s > 0:
-                stake_total_all += s
-                stake_rows_all += 1
-            rows_all.append([
-                a,
-                c,
-                f"{s:.8f}",
-                note,
-                f"https://scan.idena.io/address/{a}",
-            ])
-            if i % 200 == 0:
-                log(f"stake progress: {i}/{len(counts)}")
-
-        write_csv(
-            csv_path_all,
-            header=["address", "flipCount", "stake", "stakeNote", "scan_url"],
-            rows=rows_all,
+    csv_path = os.path.join(out_dir, f"grade_identity_leaderboard_epoch{epoch}.csv")
+    csv_rows: List[List[Any]] = []
+    for i, row in enumerate(identities_sorted, start=1):
+        csv_rows.append(
+            [
+                i,
+                f"{row['totalGradeScore']:.8f}",
+                row["flipCount"],
+                f"{row['avgGradeScore']:.8f}",
+                f"{row['maxFlipGradeScore']:.8f}",
+                row["address"],
+                f"https://scan.idena.io/address/{row['address']}",
+            ]
         )
-        log(f"Wrote ALL authors CSV: {csv_path_all}")
 
-    # Meta
-    meta = {
-        "epoch": epoch,
-        "threshold": thr,
-        "baseUrl": args.base_url,
-        "counts": {
-            "flipsSeen": seen,
-            "uniqueAuthors": total_authors,
-            "authorsOverThreshold": authors_gt_n,
-            "totalExtraFlips": total_extra_flips,
-        },
-        "stake": {
-            "fetchStakeOverThresholdEnabled": bool(do_stake_over),
-            "fetchStakeAllEnabled": bool(do_stake_all),
-            "stakeSleepSeconds": float(args.stake_sleep),
-            "overThreshold": {
-                "authorsWithStake>0": stake_rows_over,
-                "totalStake": stake_total_over,
-                "extraFlipsPerTotalStake": (total_extra_flips / stake_total_over) if (do_stake_over and stake_total_over > 0) else None,
-            },
-            "allAuthors": {
-                "authorsWithStake>0": stake_rows_all,
-                "totalStake": stake_total_all,
-            },
-        },
-        "note": "Live snapshot. Data can change until flip submission closes.",
+    write_csv(
+        csv_path,
+        header=[
+            "rank",
+            "totalGradeScore",
+            "flipCount",
+            "avgGradeScore",
+            "maxFlipGradeScore",
+            "address",
+            "scan_url",
+        ],
+        rows=csv_rows,
+    )
+
+    top_rows = identities_sorted[: max(0, top_n)]
+    top_identities: List[Dict[str, Any]] = []
+    identity_lookup: List[Dict[str, Any]] = []
+    rank_by_address: Dict[str, int] = {}
+    for i, row in enumerate(identities_sorted, start=1):
+        rank_by_address[row["address"]] = i
+        identity_lookup.append(
+            {
+                "rank": i,
+                "address": row["address"],
+                "totalGradeScore": row["totalGradeScore"],
+                "flipCount": row["flipCount"],
+                "avgGradeScore": row["avgGradeScore"],
+                "maxFlipGradeScore": row["maxFlipGradeScore"],
+                "scanUrl": f"https://scan.idena.io/address/{row['address']}",
+            }
+        )
+
+    for i, row in enumerate(top_rows, start=1):
+        top_identities.append(
+            {
+                "rank": i,
+                "address": row["address"],
+                "totalGradeScore": row["totalGradeScore"],
+                "flipCount": row["flipCount"],
+                "avgGradeScore": row["avgGradeScore"],
+                "maxFlipGradeScore": row["maxFlipGradeScore"],
+                "scanUrl": f"https://scan.idena.io/address/{row['address']}",
+            }
+        )
+
+    top_flips_sorted = sorted(
+        [item[2] for item in flip_heap],
+        key=lambda x: (x["gradeScore"], x["cid"]),
+        reverse=True,
+    )
+    top_flips: List[Dict[str, Any]] = []
+    for i, row in enumerate(top_flips_sorted, start=1):
+        author_rank = rank_by_address.get(row["author"])
+        top_flips.append(
+            {
+                "rank": i,
+                "cid": row["cid"],
+                "author": row["author"],
+                "authorRank": author_rank,
+                "gradeScore": row["gradeScore"],
+                "status": row["status"],
+                "word1": row["word1"],
+                "word2": row["word2"],
+                "scanUrl": f"https://scan.idena.io/flip/{row['cid']}",
+                "authorScanUrl": f"https://scan.idena.io/address/{row['author']}",
+            }
+        )
+
+    return {
+      ...
     }
-
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
-
-    log(f"Wrote CSV (over threshold): {csv_path_over}")
-    log(f"Wrote META: {meta_path}")
-
-    if do_stake_over and stake_total_over > 0:
-        log(f"extraFlipsPerTotalStake(over-threshold authors) = {total_extra_flips / stake_total_over:.12f}")
-
-    if do_stake_all:
-        log(f"totalStake(all flip authors with stake>0) = {stake_total_all:.8f}")
-
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-
