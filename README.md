@@ -1,5 +1,9 @@
 # Idena Community Tools - Extra Flips Live Scanner
 
+## Research disclaimer
+
+This is experimental research software. I cannot guarantee its security, correctness, or fitness for any purpose. Use it at your own risk, take responsibility for your decisions, independently verify changes, and stay vigilant.
+
 > A real-time dashboard to monitor "Extra Flips" on the Idena Blockchain, built with **Nuxt 3**.
 > This project is a web interface wrapper around the original Python script by **ubiubi18**.
 
